@@ -3,7 +3,9 @@ local storage = minetest.get_mod_storage()
 local waypoints = {} 
 local active_cameras = {} 
 
--- (Keep the math functions the same as before)
+-- === MATH FUNCTIONS FOR SMOOTHING ===
+
+-- Calculates a Catmull-Rom spline for smooth curving
 local function catmull_rom(p0, p1, p2, p3, t)
     local t2 = t * t
     local t3 = t2 * t
@@ -15,16 +17,23 @@ local function catmull_rom(p0, p1, p2, p3, t)
     )
 end
 
+-- Fixes angles so the camera takes the shortest rotational path (prevents wild spinning)
 local function normalize_angle(base, target)
     local diff = (target - base) % (math.pi * 2)
-    if diff > math.pi then diff = diff - (math.pi * 2) end
+    if diff > math.pi then 
+        diff = diff - (math.pi * 2) 
+    end
     return base + diff
 end
+
+-- === PLAYER STATE HANDLING ===
 
 local function set_cinematic_state(player, enable)
     if enable then
         local meta = player:get_meta()
         meta:set_string("old_armor", minetest.serialize(player:get_armor_groups()))
+        
+        -- Make immortal and freeze physics to prevent death/manual movement
         player:set_armor_groups({immortal = 1})
         player:set_physics_override({speed = 0, jump = 0, gravity = 0, sneak = false})
     else
@@ -39,25 +48,25 @@ local function set_cinematic_state(player, enable)
     end
 end
 
--- === UPDATED COMMANDS ===
+-- === CHAT COMMANDS ===
 
--- Clear memory so you can start a NEW project
 minetest.register_chatcommand("cclear", {
     description = "Clear current unsaved waypoints from memory",
     privs = {server = true},
     func = function(name)
         waypoints[name] = {}
-        return true, "Waypoints cleared. You have a blank slate now."
+        return true, "Waypoints cleared. Memory is now empty."
     end,
 })
 
 minetest.register_chatcommand("cset", {
     params = "<number>",
-    description = "Set a cinematic waypoint",
+    description = "Set a cinematic waypoint (e.g. /cset 1)",
     privs = {server = true},
     func = function(name, param)
         local num = tonumber(param)
         if not num then return false, "You need to provide a number!" end
+        
         local player = minetest.get_player_by_name(name)
         if not player then return false, "Player not found." end
 
@@ -73,39 +82,144 @@ minetest.register_chatcommand("cset", {
 
 minetest.register_chatcommand("csave", {
     params = "<project_name>",
-    description = "Save waypoints and CLEAR memory",
+    description = "Save waypoints to server and clear current memory",
     privs = {server = true},
     func = function(name, param)
         if param == "" then return false, "Provide a project name." end
         if not waypoints[name] or next(waypoints[name]) == nil then 
-            return false, "Nothing to save!" 
+            return false, "No waypoints to save." 
         end
         
         local data = minetest.serialize(waypoints[name])
         storage:set_string("cine_" .. name .. "_" .. param, data)
         
-        -- THE FIX: Wipe the local table after saving so Project B doesn't 
-        -- include Project A's points.
+        -- Wipe local table so the next project starts fresh
         waypoints[name] = {} 
-        
-        return true, "Project '" .. param .. "' saved to server. Memory cleared for next project."
+        return true, "Project '" .. param .. "' saved. Memory cleared."
     end,
 })
 
 minetest.register_chatcommand("cload", {
     params = "<project_name>",
-    description = "Load a project into memory",
+    description = "Load a cinematic project from server storage",
     privs = {server = true},
     func = function(name, param)
         if param == "" then return false, "Provide a project name." end
+        
         local data_str = storage:get_string("cine_" .. name .. "_" .. param)
         if data_str == "" then return false, "Project not found." end
         
-        -- This overwrites whatever is currently in memory
         waypoints[name] = minetest.deserialize(data_str)
-        return true, "Project '" .. param .. "' loaded. Use /cplay to start."
+        return true, "Project '" .. param .. "' loaded into memory."
     end,
 })
 
--- (Keep /cplay, /cstop, and the globalstep logic from the previous version)
--- [Redacted for brevity, but use the same Globalstep with Catmull-Rom logic]
+minetest.register_chatcommand("cplay", {
+    params = "<speed>",
+    description = "Play cinematic. Default speed is 1.",
+    privs = {server = true},
+    func = function(name, param)
+        local player = minetest.get_player_by_name(name)
+        if not player then return false, "Player not found." end
+        
+        if not waypoints[name] or next(waypoints[name]) == nil then
+            return false, "No waypoints loaded. Use /cload or /cset."
+        end
+
+        local speed = tonumber(param) or 1
+        local sorted_points = {}
+        for k, v in pairs(waypoints[name]) do
+            table.insert(sorted_points, {num = k, data = v})
+        end
+        table.sort(sorted_points, function(a, b) return a.num < b.num end)
+
+        if #sorted_points < 2 then
+            return false, "You need at least 2 points to play."
+        end
+
+        set_cinematic_state(player, true)
+
+        active_cameras[name] = {
+            points = sorted_points,
+            current_idx = 1,
+            timer = 0,
+            speed = speed
+        }
+        return true, "Cinematic started..."
+    end,
+})
+
+minetest.register_chatcommand("cstop", {
+    description = "Stop the cinematic early",
+    privs = {server = true},
+    func = function(name)
+        if not active_cameras[name] then return false, "Not playing." end
+        active_cameras[name] = nil
+        local player = minetest.get_player_by_name(name)
+        if player then set_cinematic_state(player, false) end
+        return true, "Cinematic stopped."
+    end,
+})
+
+-- === THE SMOOTH MOVEMENT LOGIC ===
+
+minetest.register_globalstep(function(dtime)
+    for name, cam in pairs(active_cameras) do
+        local player = minetest.get_player_by_name(name)
+        
+        if not player then
+            active_cameras[name] = nil
+        else
+            local idx = cam.current_idx
+            
+            -- P0 and P3 are "control points" to handle the curve handle logic
+            local p0 = cam.points[math.max(idx - 1, 1)].data
+            local p1 = cam.points[idx].data
+            local p2 = cam.points[idx + 1].data
+            local p3 = cam.points[math.min(idx + 2, #cam.points)].data
+            
+            local dist = vector.distance(p1.pos, p2.pos)
+            local time_needed = dist / (5 * cam.speed)
+            
+            cam.timer = cam.timer + dtime
+            local t = math.min(cam.timer / time_needed, 1)
+            
+            -- Apply Spline to Position
+            local current_pos = {
+                x = catmull_rom(p0.pos.x, p1.pos.x, p2.pos.x, p3.pos.x, t),
+                y = catmull_rom(p0.pos.y, p1.pos.y, p2.pos.y, p3.pos.y, t),
+                z = catmull_rom(p0.pos.z, p1.pos.z, p2.pos.z, p3.pos.z, t)
+            }
+            
+            -- Smooth rotation with angle normalization
+            local y0 = normalize_angle(p1.yaw, p0.yaw)
+            local y1 = p1.yaw
+            local y2 = normalize_angle(p1.yaw, p2.yaw)
+            local y3 = normalize_angle(p2.yaw, p3.yaw)
+            
+            local pt0 = normalize_angle(p1.pitch, p0.pitch)
+            local pt1 = p1.pitch
+            local pt2 = normalize_angle(p1.pitch, p2.pitch)
+            local pt3 = normalize_angle(p2.pitch, p3.pitch)
+
+            local current_yaw = catmull_rom(y0, y1, y2, y3, t)
+            local current_pitch = catmull_rom(pt0, pt1, pt2, pt3, t)
+            
+            player:set_pos(current_pos)
+            player:set_look_vertical(current_pitch)
+            player:set_look_horizontal(current_yaw)
+            
+            if t >= 1 then
+                cam.current_idx = cam.current_idx + 1
+                cam.timer = 0
+                
+                -- Check if we hit the end of the waypoint list
+                if cam.current_idx >= #cam.points then
+                    active_cameras[name] = nil
+                    set_cinematic_state(player, false)
+                    minetest.chat_send_player(name, "Cinematic finished.")
+                end
+            end
+        end
+    end
+end)
